@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Dedupe Studio v1.2 — single-file duplicate-cleanup app with a local UI.
+Dedupe Studio v1.3 — single-file duplicate-cleanup app with a local UI.
 Python 3.8+ stdlib only. Runs on Windows, Linux, Termux, macOS.
 
     python dedupe_studio.py [folder ...] [--port 7788] [--no-browser]
@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.2'
+VERSION = '1.3'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -68,6 +68,7 @@ STATE = {
     'scanned': 0, 'empty_skipped': 0, 'errors': 0, 'error_paths': [],
     'groups': [], 'singletons': False, 'message': '', 'cancel': False,
     'algo': 'sha256', 'imported': 0, 'cached': 0,
+    'job': {},                # background trash/delete run (v1.3)
 }
 
 
@@ -108,11 +109,36 @@ def norm(p):
     return os.path.normcase(os.path.normpath(p))
 
 
-def note_error(path):
+def why(path, e):
+    """Plain-language reason a file/folder couldn't be read."""
+    if e is None:
+        return ''
+    win = getattr(e, 'winerror', None)
+    no = getattr(e, 'errno', None)
+    stand_in = any(0xF000 <= ord(c) <= 0xF0FF for c in str(path))
+    if stand_in:
+        return "name contains a stand-in for : | ? * (made on Linux/Android); rename it on the device that owns it"
+    if win == 32:
+        return 'open in another program'
+    if win in (5,) or no == 13:
+        return 'access denied (protected by Windows or another user)'
+    if win in (362, 388, 389, 390, 391, 1004) or no == 22 and 'cloud' in str(e).lower():
+        return 'online-only cloud file'
+    if len(str(path)) >= 260:
+        return 'path over 260 characters'
+    if win in (2, 3) or no == 2:
+        return 'not found (moved or deleted during the scan)'
+    if win == 123:
+        return "name Windows can't open"
+    return getattr(e, 'strerror', None) or e.__class__.__name__
+
+
+def note_error(path, e=None):
     with LOCK:
         STATE['errors'] += 1
         if len(STATE['error_paths']) < 1000:
-            STATE['error_paths'].append(path)
+            r = why(path, e)
+            STATE['error_paths'].append('%s\t%s' % (path, r) if r else path)
 
 
 def excluded(path, name, patterns):
@@ -175,7 +201,7 @@ def scan_worker(roots, opts):
         with LOCK:
             STATE['stage'] = 'Listing files'
         for root in roots:
-            for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: note_error(getattr(e, 'filename', '?'))):
+            for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: note_error(getattr(e, 'filename', '?'), e)):
                 if STATE['cancel']:
                     raise InterruptedError
                 dirnames[:] = [d for d in dirnames
@@ -195,8 +221,8 @@ def scan_worker(roots, opts):
                         continue
                     try:
                         st = os.stat(p)
-                    except OSError:
-                        note_error(p)
+                    except OSError as e:
+                        note_error(p, e)
                         continue
                     with LOCK:
                         STATE['scanned'] += 1
@@ -255,8 +281,8 @@ def scan_worker(roots, opts):
                 with open(p, 'rb') as f:
                     qh = hashlib.sha256(f.read(65536)).hexdigest()[:16]
                 qh_groups.setdefault((size, qh), []).append(rec)
-            except OSError:
-                note_error(p)
+            except OSError as e:
+                note_error(p, e)
         for recs in qh_groups.values():
             if len(recs) > 1 or include_singletons:
                 kept.extend(recs)
@@ -292,8 +318,8 @@ def scan_worker(roots, opts):
             p, size, st, root = cands[i]
             try:
                 return i, hash_file(p, algo)
-            except OSError:
-                note_error(p)
+            except OSError as e:
+                note_error(p, e)
                 return i, None
             finally:
                 with LOCK:
@@ -373,7 +399,51 @@ def open_log(root):
     return lf
 
 
-def do_trash(paths, mode):
+HISTORY = os.path.join(os.path.expanduser('~'), 'DedupeStudio', 'history.tsv')
+
+
+def history_write(rows):
+    """Master log across every root and run: time, action, hash, original, kept, destination."""
+    try:
+        os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
+        new = not os.path.exists(HISTORY)
+        with open(HISTORY, 'a', encoding='utf-8', newline='') as hf:
+            if new:
+                hf.write('time\taction\thash\toriginal\tkept\tdestination\n')
+            hf.writelines(rows)
+    except OSError:
+        pass
+
+
+def start_trash(paths, mode, action):
+    """Validate on the request thread, then move/delete in the background so the UI can
+    show progress (v1.2 ran it inside one HTTP request: on slow drives nothing visible
+    happened for minutes)."""
+    with LOCK:
+        if STATE['job'].get('running'):
+            return {'ok': False, 'error': 'A trash/delete run is already in progress'}
+    chk = do_trash(paths, mode, action, check_only=True)
+    if not chk.get('ok'):
+        return chk
+    with LOCK:
+        STATE['cancel'] = False
+        STATE['job'] = {'running': True, 'action': action, 'done': 0, 'total': len(set(paths)),
+                        'moved': 0, 'bytes': 0, 'errors': [], 'result': None}
+    threading.Thread(target=_trash_worker, args=(paths, mode, action), daemon=True).start()
+    return {'ok': True, 'started': True}
+
+
+def _trash_worker(paths, mode, action):
+    try:
+        res = do_trash(paths, mode, action)
+    except Exception as e:  # noqa: BLE001
+        res = {'ok': False, 'error': str(e)}
+    with LOCK:
+        STATE['job']['running'] = False
+        STATE['job']['result'] = res
+
+
+def do_trash(paths, mode, action='trash', check_only=False):
     sel = set(paths)
     with LOCK:
         groups = STATE['groups']
@@ -391,34 +461,55 @@ def do_trash(paths, mode):
             if gp and gp <= sel:
                 return {'ok': False, 'error': 'Careful mode: set %s would lose ALL copies. '
                         'Deselect one, or switch to Destructive mode.' % g['hash'][:12]}
+    if check_only:
+        return {'ok': True}
+    delete = action == 'delete'
+    hist = []
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     logs, run_dirs, done = {}, set(), set()
     moved, bytes_moved, errors = 0, 0, []
     try:
         for p in sorted(sel):
+            if STATE['cancel']:
+                errors.append('Cancelled - the remaining files were left untouched')
+                break
             g, f = by_path[p]
             root = f['root']
             kept = next((x['path'] for x in g['files'] if x['path'] not in sel), '-')
             run_dir = os.path.join(trash_root(root), stamp)
-            dest = os.path.join(run_dir, f['rel'])
-            if os.path.exists(dest):
-                dest = dest + '.' + str(time.time_ns())
+            if delete:
+                dest = 'DELETED'
+            else:
+                dest = os.path.join(run_dir, f['rel'])
+                if os.path.exists(dest):
+                    dest = dest + '.' + str(time.time_ns())
             try:
-                move_file(p, dest)
+                if delete:
+                    os.remove(p)
+                else:
+                    move_file(p, dest)
             except Exception as e:  # noqa: BLE001
                 errors.append('%s: %s' % (p, e))
+                with LOCK:
+                    STATE['job']['done'] += 1
+                    STATE['job']['errors'] = errors[-200:]
                 continue
+            hist.append('%s\t%s\t%s\t%s\t%s\t%s\n' % (stamp, action, g['hash'], p, kept, dest))
             if root not in logs:
                 logs[root] = open_log(root)
             logs[root].write('%s\t%s\t%s\t%s\t%s\n' % (stamp, g['hash'], p, kept, dest))
             logs[root].flush()  # a crash can never lose an undo row
-            run_dirs.add(run_dir)
+            if not delete:
+                run_dirs.add(run_dir)
             done.add(p)
             moved += 1
             bytes_moved += g['size']
+            with LOCK:
+                STATE['job'].update(done=STATE['job'].get('done', 0) + 1, moved=moved, bytes=bytes_moved)
     finally:
         for lf in logs.values():
             lf.close()
+        history_write(hist)
     with LOCK:
         minc = 1 if STATE['singletons'] else 2
         left = []
@@ -429,8 +520,9 @@ def do_trash(paths, mode):
             if g['count'] >= minc:
                 left.append(g)
         STATE['groups'] = left
-    return {'ok': True, 'moved': moved, 'bytes': bytes_moved, 'errors': errors,
-            'trash': ' + '.join(sorted(run_dirs)) or '-', 'groups': left}
+    return {'ok': True, 'moved': moved, 'bytes': bytes_moved, 'errors': errors, 'action': action,
+            'trash': ' + '.join(sorted(run_dirs)) or ('permanently deleted' if delete else '-'),
+            'history': HISTORY, 'groups': left}
 
 
 def read_log(root):
@@ -549,14 +641,33 @@ def export_csv():
 
 # ------------------------------------------------------------------ folder picking
 def pick_folder(start):
-    """Native folder dialog via tkinter in a child process (keeps the server thread free)."""
+    """Native folder dialog.
+    Desktop app (pywebview loaded in this process): use the window's own dialog.
+    Plain script: tkinter in a child Python process. Never launch sys.executable when
+    frozen - in a PyInstaller build that is this app, not Python (v1.2 bug: every
+    "Add folder" opened a second copy of the app)."""
+    wv = sys.modules.get('webview')
+    if wv is not None and getattr(wv, 'windows', None):
+        try:
+            kind = getattr(getattr(wv, 'FileDialog', None), 'FOLDER', None)
+            if kind is None:
+                kind = wv.FOLDER_DIALOG
+            res = wv.windows[0].create_file_dialog(kind, directory=start if os.path.isdir(start or '') else '')
+        except Exception as e:  # noqa: BLE001
+            return {'ok': False, 'error': 'folder dialog failed: %s' % e}
+        if not res:
+            return {'ok': False, 'cancelled': True}
+        path = res[0] if isinstance(res, (list, tuple)) else res
+        return {'ok': True, 'path': os.path.normpath(path)}
+    if getattr(sys, 'frozen', False):
+        return {'ok': False, 'error': 'no native folder picker available'}
     code = ('import tkinter as t, tkinter.filedialog as f, sys\n'
             'r=t.Tk(); r.withdraw(); r.attributes("-topmost", True)\n'
             'p=f.askdirectory(initialdir=sys.argv[1] or None, title="Pick a folder to scan")\n'
             'sys.stdout.write(p or "::CANCEL::")\n')
     try:
         out = subprocess.run([sys.executable, '-c', code, start or ''], capture_output=True,
-                             text=True, timeout=1800).stdout.strip()
+                             text=True, timeout=300).stdout.strip()
     except Exception as e:  # noqa: BLE001
         return {'ok': False, 'error': str(e)}
     if out == '::CANCEL::':
@@ -641,6 +752,9 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 body = json.dumps({'groups': STATE['groups'], 'singletons': STATE['singletons']})
             return self._send(body.encode('utf-8'), 'application/json')
+        if url.path == '/api/job':
+            with LOCK:
+                return self._json(dict(STATE['job']))
         if url.path == '/api/errors':
             with LOCK:
                 return self._json({'ok': True, 'count': STATE['errors'], 'paths': list(STATE['error_paths'])})
@@ -709,7 +823,8 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 if STATE['phase'] != 'done':
                     return self._json({'ok': False, 'error': 'Scan first'})
-            return self._json(do_trash(req.get('paths') or [], req.get('mode', 'careful')))
+            action = 'delete' if req.get('action') == 'delete' else 'trash'
+            return self._json(start_trash(req.get('paths') or [], req.get('mode', 'careful'), action))
         if not roots:
             return self._json({'ok': False, 'error': 'Pick a folder and scan first'})
         if route == '/api/runs':
@@ -842,6 +957,7 @@ a{color:var(--acc)}
     <button id="mDest" class="destructive" onclick="setMode('destructive')" title="Allows selecting every copy in a set (still moved to trash, never hard-deleted)">Destructive</button>
   </span>
   <button class="danger" id="trashBtn" onclick="trashSel()" disabled>Trash selected</button>
+  <label class="hint" title="Power-user option for SSH / network drives where a trash folder is slow or impossible. Permanent: no undo."><input type="checkbox" id="hardDel" onchange="render()"> Delete permanently</label>
   <button onclick="openUndo()">Undo…</button>
   <button onclick="openEmpty()">Empty folders…</button>
   <button onclick="exportCsv()">Export CSV</button>
@@ -939,9 +1055,9 @@ async function poll(){
    (s.cached||s.imported?` · ${s.cached+s.imported} hashes reused`:'')+
    (s.errors?` · <a href="#" onclick="showErrors();return false">${s.errors} unreadable</a>`:''),7000)}
  else if(s.message)toast(esc(s.message),6000)}
-async function showErrors(){const r=await api('/api/errors');
- $('errcount').textContent=`${r.count} file(s) or folder(s) couldn't be read (permissions, paths over 260 characters, locked or online-only files)`+(r.count>r.paths.length?` · first ${r.paths.length} shown`:'');
- $('errlist').innerHTML=r.paths.map(p=>`<div>${esc(p)}</div>`).join('')||'<div>None</div>';$('errM').style.display='flex'}
+async function showErrors(){const r=await api('/api/errors');$('errM').querySelector('b').textContent='Unreadable files';
+ $('errcount').textContent=`${r.count} file(s) or folder(s) couldn't be read`+(r.count>r.paths.length?` · first ${r.paths.length} shown`:'');
+ $('errlist').innerHTML=r.paths.map(x=>{const[p,why]=x.split('\t');return `<div>${esc(p)}${why?`<br><span class="hint">↳ ${esc(why)}</span>`:''}</div>`}).join('')||'<div>None</div>';$('errM').style.display='flex'}
 
 /* ---------- rendering ---------- */
 function visible(){const q=$('search').value.trim().toLowerCase();
@@ -969,7 +1085,7 @@ function render(){
  $('more').textContent=`Show more sets (${vis.length-slice.length} hidden)`;
  updateStats()}
 function updateStats(){let n=0,b=0;for(const g of groups)for(const f of g.files)if(sel.has(f.path)){n++;b+=f.size}
- $('stats').innerHTML=`<b>${n}</b> selected · <b>${fmtB(b)}</b>`;$('trashBtn').disabled=!n}
+ $('stats').innerHTML=`<b>${n}</b> selected · <b>${fmtB(b)}</b>`;$('trashBtn').disabled=!n;$('trashBtn').textContent=$('hardDel').checked?'Delete selected':'Trash selected'}
 
 /* ---------- DLM rules ---------- */
 // Item 4: tool-made names lose to human ones; Android collision copies lose
@@ -1023,11 +1139,22 @@ function setMode(m){mode=m;$('mCare').classList.toggle('on',m==='careful');$('mD
  if(careful()){for(const g of groups){if(g.files.length&&g.files.every(f=>sel.has(f.path)))sel.delete(g.files[0].path)}}render()}
 
 /* ---------- actions ---------- */
-async function trashSel(){const n=sel.size;if(!n)return;
- if(!confirm(`Move ${n} file(s) to the trash folder?\n(Never hard-deleted. Undo… restores them.)`))return;
- const r=await api('/api/trash',{paths:[...sel],mode});if(!r.ok){toast(esc(r.error));return}
+async function trashSel(){const n=sel.size;if(!n)return;const del=$('hardDel').checked;
+ if(del){const a=prompt(`PERMANENTLY delete ${n} file(s)? There is no undo.\nType DELETE to confirm.`);if(a!=='DELETE')return}
+ else if(!confirm(`Move ${n} file(s) to the trash folder?\n(Nothing is deleted. Undo… restores them.)`))return;
+ const r=await api('/api/trash',{paths:[...sel],mode,action:del?'delete':'trash'});if(!r.ok){toast(esc(r.error));return}
+ $('progress').style.display='block';jobPoll()}
+async function jobPoll(){let j;try{j=await api('/api/job')}catch(e){toast(esc(e.message),9000);return}
+ const verb=j.action==='delete'?'Deleting':'Moving to trash';
+ if(j.running){$('pstage').innerHTML=`${verb} — ${j.done}/${j.total} · ${fmtB(j.bytes||0)}`+(j.errors&&j.errors.length?` · ${j.errors.length} failed`:'');
+  $('pbar').style.width=j.total?(100*j.done/j.total)+'%':'8%';setTimeout(jobPoll,500);return}
+ $('progress').style.display='none';const r=j.result||{};
+ if(!r.ok){showResult('Run failed',esc(r.error||'unknown error'),[]);return}
  sel.clear();groups=r.groups||[];page=0;render();
- toast(`Moved ${r.moved} file(s) · ${fmtB(r.bytes)} → <code>${esc(r.trash)}</code>`+(r.errors&&r.errors.length?` · ${r.errors.length} failed`:''),6500)}
+ showResult(`${r.action==='delete'?'Deleted':'Moved to trash'}: ${r.moved} file(s) · ${fmtB(r.bytes)}`,
+  `${r.action==='delete'?'':'Trash: <code>'+esc(r.trash)+'</code><br>'}History: <code>${esc(r.history)}</code>`,r.errors||[])}
+function showResult(title,html,errs){$('errcount').innerHTML=`<b>${title}</b><br>${html}`+(errs.length?`<br>${errs.length} problem(s):`:'');
+ $('errlist').innerHTML=errs.map(x=>`<div>${esc(x)}</div>`).join('');$('errM').querySelector('b').textContent='Result';$('errM').style.display='flex'}
 function exportCsv(){location.href='/api/export?t='+encodeURIComponent(TOKEN)}
 async function openUndo(){const r=await api('/api/runs',{});if(!r.ok){toast(esc(r.error));return}
  $('ulist').innerHTML=(r.runs||[]).slice().reverse().map(x=>`<div class="runrow"><span>${esc(x.run)} — ${x.count} file(s), <b>${x.restorable}</b> still in trash</span>
