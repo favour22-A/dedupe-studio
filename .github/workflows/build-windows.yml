@@ -1,0 +1,25 @@
+name: build-windows
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: ./build.ps1
+        shell: pwsh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DedupeStudio-win64
+          path: dist/DedupeStudio-win64.zip
+      - if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/DedupeStudio-win64.zip

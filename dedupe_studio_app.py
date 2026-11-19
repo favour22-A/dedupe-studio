@@ -1,0 +1,114 @@
+"""Dedupe Studio desktop app.
+
+Runs dedupe_studio.py (unchanged) in the background and shows its UI in a
+native window instead of a browser tab. Finds the UI address by catching the
+studio's webbrowser.open() call, or a localhost URL it prints. Set
+DEDUPE_STUDIO_URL to force an address.
+"""
+import io
+import os
+import re
+import runpy
+import sys
+import threading
+import time
+import urllib.request
+import webbrowser
+
+import webview
+
+if os.environ.get("__PYINSTALLER_ANALYSIS_ONLY__"):
+    import dedupe_studio  # noqa: F401  (never runs; lets PyInstaller bundle its imports)
+
+URL_RE = re.compile(r"https?://(?:127\.0\.0\.1|localhost|0\.0\.0\.0)(?::\d+)?[^\s'\"<>]*")
+_found = threading.Event()
+_url = {}
+
+
+def _resource(name):
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
+
+
+def _capture(url):
+    if not _found.is_set():
+        _url["value"] = url.replace("0.0.0.0", "127.0.0.1")
+        _found.set()
+
+
+def _fake_open(url, *args, **kwargs):
+    _capture(url)
+    return True
+
+
+class _Watch(io.TextIOBase):
+    """Passes output through and watches it for a localhost URL."""
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def write(self, s):
+        m = URL_RE.search(s)
+        if m:
+            _capture(m.group(0))
+        if self.inner is not None:
+            try:
+                self.inner.write(s)
+            except Exception:
+                pass
+        return len(s)
+
+    def flush(self):
+        if self.inner is not None:
+            try:
+                self.inner.flush()
+            except Exception:
+                pass
+
+
+def _run_studio():
+    script = _resource("dedupe_studio.py")
+    sys.argv = [script]
+    try:
+        runpy.run_path(script, run_name="__main__")
+    except SystemExit:
+        pass
+    except Exception as exc:  # show the error instead of a blank window
+        _url["error"] = repr(exc)
+        _found.set()
+
+
+def _wait_until_up(url, timeout=30):
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            urllib.request.urlopen(url, timeout=2)
+            return True
+        except Exception:
+            time.sleep(0.3)
+    return False
+
+
+def main():
+    forced = os.environ.get("DEDUPE_STUDIO_URL")
+    if forced:
+        _capture(forced)
+    webbrowser.open = webbrowser.open_new = webbrowser.open_new_tab = _fake_open
+    sys.stdout = _Watch(sys.stdout)
+    sys.stderr = _Watch(sys.stderr)
+
+    threading.Thread(target=_run_studio, daemon=True).start()
+
+    if not _found.wait(30) or "error" in _url:
+        msg = _url.get("error", "Dedupe Studio did not report its address within 30 s.")
+        webview.create_window("Dedupe Studio - error", html=f"<pre>{msg}</pre>")
+    else:
+        url = _url["value"]
+        _wait_until_up(url)
+        webview.create_window("Dedupe Studio", url, width=1280, height=820, min_size=(900, 600))
+    webview.start()
+    os._exit(0)  # stop the studio server when the window closes
+
+
+if __name__ == "__main__":
+    main()
