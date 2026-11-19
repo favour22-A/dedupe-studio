@@ -730,7 +730,7 @@ class Handler(BaseHTTPRequestHandler):
         if not self._host_ok():
             return self._send(b'forbidden', 'text/plain', 403)
         if url.path == '/':
-            return self._send(INDEX_HTML.encode('utf-8'), 'text/html; charset=utf-8')
+            return self._send(INDEX_HTML.replace('%%VERSION%%', VERSION).encode('utf-8'), 'text/html; charset=utf-8')
         if url.path == '/api/export':  # a download link can't send headers: key in the query
             if parse_qs(url.query).get('t', [''])[0] != TOKEN:
                 return self._send(b'forbidden', 'text/plain', 403)
@@ -912,7 +912,7 @@ a{color:var(--acc)}
 </style></head><body>
 <header>
  <div class="hrow">
-  <h1>Dedupe Studio<small>v1.2</small></h1>
+  <h1>Dedupe Studio<small>v%%VERSION%%</small></h1>
   <input id="path" placeholder="Folder(s) to scan — several: separate with ;  e.g. C:\Users\Admin\Inbox; J:\EverythingFolder">
   <button onclick="openBrowse()" title="Add a folder">Add folder…</button>
   <select id="type">
