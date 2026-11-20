@@ -38,6 +38,11 @@ _unblock_self()
 
 import webview  # noqa: E402  (after the unblock on purpose)
 
+try:  # let Export CSV and Save as .txt download inside the app window
+    webview.settings["ALLOW_DOWNLOADS"] = True
+except Exception:  # noqa: BLE001
+    pass
+
 if os.environ.get("__PYINSTALLER_ANALYSIS_ONLY__"):
     import dedupe_studio  # noqa: F401  (never runs; lets PyInstaller bundle its imports)
 
