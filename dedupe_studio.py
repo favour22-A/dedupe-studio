@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3.2'
+VERSION = '1.3.3'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -51,6 +51,16 @@ GAME_EXCLUDES = ['steamapps', 'SteamLibrary', 'Steam', 'Epic Games', 'GOG Games'
                  'Origin Games', 'EA Games', 'Ubisoft Game Launcher', 'Battle.net', 'Riot Games',
                  'XboxGames', 'WindowsApps', 'My Games', 'Saved Games', '.minecraft', 'Roblox',
                  'Zomboid', 'ProjectZomboid', 'Project Zomboid']
+# Skip presets for the "Skip" dropdown (v1.3.3). Each name matches a folder/file name anywhere.
+SKIP_PRESETS = {
+    'games': ('Games', GAME_EXCLUDES),
+    'system': ('Windows system & app data', ['AppData', 'Application Data', 'Local Settings', 'My Documents',
+               'Cookies', 'NetHood', 'PrintHood', 'Recent', 'SendTo', 'Start Menu', 'Templates', 'NTUSER*',
+               'IntelGraphicsProfiles', 'Windows', 'Program Files', 'Program Files (x86)', 'ProgramData']),
+    'hidden': ('Hidden dot folders & files', ['.*']),
+    'cloud': ('Cloud-synced folders', ['OneDrive', 'WPS Cloud Files', 'DriveFS', 'drive_cache', 'Dropbox', 'iCloudDrive']),
+    'code': ('Code & build folders', ['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'build', 'dist', 'target']),
+}
 PRESETS = {
     'all': None,
     'pictures': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.heic', '.heif', '.webp', '.raw',
@@ -807,8 +817,12 @@ class Handler(BaseHTTPRequestHandler):
             if preset == 'custom' and custom:
                 exts = {('.' + e.strip().lstrip('.').lower()) for e in custom.split(',') if e.strip()}
             excludes = [x.strip() for x in (req.get('excludes') or '').replace('\n', ';').split(';') if x.strip()]
-            if req.get('skip_games', True):
-                excludes += GAME_EXCLUDES
+            skips = req.get('skip_presets')
+            if skips is None:  # older callers: games on unless turned off
+                skips = ['games'] if req.get('skip_games', True) else []
+            for k in skips:
+                if k in SKIP_PRESETS:
+                    excludes += SKIP_PRESETS[k][1]
             with LOCK:
                 if STATE['phase'] == 'scanning':
                     return self._json({'ok': False, 'error': 'Scan already running'})
@@ -916,6 +930,8 @@ width:min(760px,92vw);max-height:80vh;display:flex;flex-direction:column;padding
 .hint{color:var(--dim);font-size:12px}
 #more{width:100%;padding:10px;margin-bottom:30px}
 a{color:var(--acc)}
+.skipdd{position:relative}.skipdd summary{cursor:pointer;list-style:none;padding:4px 10px;border:1px solid var(--line);border-radius:6px;font-size:12px;color:var(--dim)}
+.skipdd .skipbox{position:absolute;z-index:20;top:110%;left:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-width:240px}
 </style></head><body>
 <header>
  <div class="hrow">
@@ -940,7 +956,13 @@ a{color:var(--acc)}
   <label>Hash <select id="algo"><option value="sha256">SHA-256</option><option value="md5">MD5 (matches rclone / Drive / DLM CSV)</option></select></label>
   <label>Threads <select id="threads" title="1 is fastest on a single spinning/external disk"><option>1</option><option>2</option><option selected>4</option><option>8</option></select></label>
   <label><input type="checkbox" id="skipjunk" checked> Ignore desktop.ini / Thumbs.db</label>
-  <label title="Steam, Epic, GOG, Xbox, Minecraft, Roblox, Project Zomboid and other game folders: their files repeat on purpose"><input type="checkbox" id="skipgames" checked> Skip game folders</label>
+  <details class="skipdd" id="skipdd"><summary id="skipsum">Skip: Games</summary><div class="skipbox">
+    <label title="Steam, Epic, GOG, Xbox, Minecraft, Roblox, Project Zomboid…: their files repeat on purpose"><input type="checkbox" class="skp" value="games" checked onchange="skipSum()"> Games</label>
+    <label title="AppData, Start Menu, NTUSER, Program Files…"><input type="checkbox" class="skp" value="system" onchange="skipSum()"> Windows system &amp; app data</label>
+    <label title=".claude, .ssh, .bash_history…"><input type="checkbox" class="skp" value="hidden" onchange="skipSum()"> Hidden dot folders &amp; files</label>
+    <label title="OneDrive, WPS Cloud, Google Drive cache, Dropbox, iCloud"><input type="checkbox" class="skp" value="cloud" onchange="skipSum()"> Cloud-synced folders</label>
+    <label title=".git, node_modules, .venv, build, dist…"><input type="checkbox" class="skp" value="code" onchange="skipSum()"> Code &amp; build folders</label>
+  </div></details>
   <label>Hash list <input id="hlist" style="width:260px" placeholder="optional: path to dlm_windows_md5.csv" title="Reuse hashes from a CSV (MD5,Length,…,FullName) instead of hashing"></label>
  </div>
 </header>
@@ -1025,6 +1047,7 @@ async function api(p,body){const o={headers:{'X-Token':TOKEN}};
 function toast(msg,ms){const t=$('toast');t.innerHTML=msg;t.style.display='block';clearTimeout(t._h);t._h=setTimeout(()=>t.style.display='none',ms||4200)}
 $('type').onchange=()=>{$('exts').style.display=$('type').value==='custom'?'':'none'};
 $('path').addEventListener('keydown',e=>{if(e.key==='Enter')startScan()});
+function skipSum(){const n=[...document.querySelectorAll('.skp:checked')].map(x=>x.parentElement.textContent.trim().split(' ')[0]);$('skipsum').textContent='Skip: '+(n.length?n.join(', '):'nothing')}
 function toggleOpts(){const o=$('opts');o.style.display=o.style.display==='flex'?'none':'flex'}
 
 /* ---------- scanning ---------- */
@@ -1033,7 +1056,7 @@ async function startScan(){
  const minsz=Math.round((parseFloat($('minsz').value)||0)*parseInt($('minu').value));
  let r;try{r=await api('/api/scan',{roots,type:$('type').value,exts:$('exts').value,min_size:minsz,
   match:$('nmatch').value,excludes:$('excl').value,algo:$('algo').value,threads:parseInt($('threads').value),
-  skip_junk:$('skipjunk').checked,skip_games:$('skipgames').checked,hash_list:$('hlist').value,
+  skip_junk:$('skipjunk').checked,skip_presets:[...document.querySelectorAll('.skp:checked')].map(x=>x.value),hash_list:$('hlist').value,
   include_singletons:mode==='destructive'&&!!$('nmatch').value.trim()})}catch(e){toast(esc(e.message));return}
  if(!r.ok){toast(esc(r.error));return}
  if(r.algo!==$('algo').value){$('algo').value=r.algo;toast('Hash set to '+r.algo.toUpperCase()+' to match the hash list')}
