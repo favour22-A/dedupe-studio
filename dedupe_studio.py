@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3.7'
+VERSION = '1.3.8'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -85,6 +85,7 @@ STATE = {
     'groups': [], 'singletons': False, 'message': '', 'cancel': False,
     'algo': 'sha256', 'imported': 0, 'cached': 0,
     'job': {},                # background trash/delete run (v1.3)
+    'current': '', 'qdone': 0, 'qtotal': 0,   # live position + quick-check progress (v1.3.8)
 }
 
 
@@ -149,7 +150,46 @@ def why(path, e):
     return getattr(e, 'strerror', None) or e.__class__.__name__
 
 
+ACTIVITY = os.path.join(os.path.expanduser('~'), 'DedupeStudio', 'activity.log')
+_ACT = {'fh': None}
+_ACT_LOCK = threading.Lock()
+
+
+def act(msg):
+    """Activity log: every stage, folder, file and error with a timestamp, so a stall
+    shows the last thing the app touched (v1.3.8). ~/DedupeStudio/activity.log."""
+    line = '%s\t%s\n' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), msg)
+    with _ACT_LOCK:
+        try:
+            if _ACT['fh'] is None:
+                os.makedirs(os.path.dirname(ACTIVITY), exist_ok=True)
+                if os.path.exists(ACTIVITY) and os.path.getsize(ACTIVITY) > 50 * 1024 * 1024:
+                    os.replace(ACTIVITY, ACTIVITY + '.old')
+                _ACT['fh'] = open(ACTIVITY, 'a', encoding='utf-8', errors='replace')
+            _ACT['fh'].write(line)
+            _ACT['fh'].flush()
+        except OSError:
+            pass
+
+
+def tail_activity(n=300):
+    try:
+        with open(ACTIVITY, 'rb') as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 200000))
+            return f.read().decode('utf-8', 'replace').splitlines()[-n:]
+    except OSError:
+        return []
+
+
+def now(path):
+    with LOCK:
+        STATE['current'] = path
+
+
 def note_error(path, e=None):
+    act('ERROR\t%s\t%s' % (path, why(path, e) if e is not None else ''))
     with LOCK:
         STATE['errors'] += 1
         if len(STATE['error_paths']) < 1000:
@@ -216,10 +256,13 @@ def scan_worker(roots, opts):
         seen = set()
         with LOCK:
             STATE['stage'] = 'Listing files'
+        act('SCAN START\troots=%s\talgo=%s\tthreads=%d' % ('; '.join(roots), algo, threads))
         for root in roots:
             for dirpath, dirnames, filenames in os.walk(root, onerror=lambda e: note_error(getattr(e, 'filename', '?'), e)):
                 if STATE['cancel']:
                     raise InterruptedError
+                now(dirpath)
+                act('LIST\t%s' % dirpath)
                 dirnames[:] = [d for d in dirnames
                                if norm(os.path.join(dirpath, d)) not in trash_dirs
                                and not excluded(os.path.join(dirpath, d), d, patterns)]
@@ -285,6 +328,9 @@ def scan_worker(roots, opts):
         # quick-hash prefilter: unique first 64 KB within a size group => not a dup
         with LOCK:
             STATE['stage'] = 'Quick-checking large files'
+            STATE['qtotal'] = sum(1 for r in cands if r[1] >= QH_MIN)
+            STATE['qdone'] = 0
+        act('STAGE\tquick-check\tcandidates=%d\tlarge=%d' % (len(cands), STATE['qtotal']))
         qh_groups, kept = {}, []
         for rec in cands:
             p, size, st, root = rec
@@ -293,6 +339,10 @@ def scan_worker(roots, opts):
                 continue
             if STATE['cancel']:
                 raise InterruptedError
+            now(p)
+            act('QUICK\t%s\t%d' % (p, size))
+            with LOCK:
+                STATE['qdone'] += 1
             try:
                 with open(p, 'rb') as f:
                     qh = hashlib.sha256(f.read(65536)).hexdigest()[:16]
@@ -332,6 +382,8 @@ def scan_worker(roots, opts):
             if STATE['cancel']:
                 return i, None
             p, size, st, root = cands[i]
+            now(p)
+            act('HASH\t%s\t%d' % (p, size))
             try:
                 return i, hash_file(p, algo)
             except OSError as e:
@@ -498,7 +550,9 @@ def do_trash(paths, mode, action='trash', check_only=False):
     logs, run_dirs, done = {}, set(), set()
     moved, bytes_moved, errors = 0, 0, []
     try:
+        act('%s START\t%d files' % (action.upper(), len(sel)))
         for p in sorted(sel):
+            act('%s\t%s' % (action.upper(), p))
             if STATE['cancel']:
                 errors.append('Cancelled - the remaining files were left untouched')
                 break
@@ -771,7 +825,7 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == '/api/state':
             with LOCK:
                 s = {k: STATE[k] for k in ('phase', 'roots', 'stage', 'done', 'total', 'scanned',
-                                           'empty_skipped', 'errors', 'message', 'singletons',
+                                           'empty_skipped', 'errors', 'message', 'singletons', 'current', 'qdone', 'qtotal',
                                            'bytes_done', 'bytes_total', 'algo', 'cached', 'imported')}
                 s['elapsed'] = time.time() - STATE['hash_started'] if STATE['hash_started'] else 0
             s['version'] = VERSION
@@ -781,6 +835,8 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 body = json.dumps({'groups': STATE['groups'], 'singletons': STATE['singletons']})
             return self._send(body.encode('utf-8'), 'application/json')
+        if url.path == '/api/log':
+            return self._json({'ok': True, 'path': ACTIVITY, 'lines': tail_activity()})
         if url.path == '/api/job':
             with LOCK:
                 return self._json(dict(STATE['job']))
@@ -1008,6 +1064,7 @@ body.dropping{outline:3px dashed var(--acc);outline-offset:-8px}
   <button onclick="openUndo()">Undo…</button>
   <button onclick="openEmpty()">Empty folders…</button>
   <button onclick="exportCsv()">Export CSV</button>
+  <button onclick="showLog()" title="Everything the app did, newest last: use it when something looks stuck">Log</button>
   <span id="stats"></span>
 </div>
 
@@ -1081,6 +1138,10 @@ async function copyErr(){const t=errText();let ok=false;
  toast(ok?`Copied ${t.split('\n').length} lines`:'Copy failed: use Save as .txt',3000)}
 function saveErr(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([errText()],{type:'text/plain'}));
  a.download='dedupe_problems_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.txt';document.body.appendChild(a);a.click();a.remove()}
+async function showLog(){const r=await api('/api/log');$('errM').querySelector('b').textContent='Activity log (last 300 lines)';
+ $('errcount').innerHTML=`File: <code>${esc(r.path)}</code><br>Newest at the bottom. If the scan seems frozen, the last line is the file it is stuck on.`;
+ $('errlist').innerHTML=r.lines.map(l=>`<div>${esc(l)}</div>`).join('')||'<div>Empty</div>';$('errM').style.display='flex';
+ const L=$('errlist');L.scrollTop=L.scrollHeight}
 function toggleOpts(){const o=$('opts');o.style.display=o.style.display==='flex'?'none':'flex'}
 
 /* ---------- scanning ---------- */
@@ -1108,8 +1169,11 @@ async function poll(){
   $('pstage').innerHTML=`${esc(s.stage)} — checked ${s.scanned}`+
    (s.total?` · hashing ${s.done}/${s.total} (${fmtB(s.bytes_done)} of ${fmtB(s.bytes_total)})`:'')+eta+
    (s.cached||s.imported?` · reused ${s.cached+s.imported}`:'')+
-   (s.errors?` · <a href="#" onclick="showErrors();return false">unreadable ${s.errors}</a>`:'');
-  $('pbar').style.width=s.bytes_total?(100*s.bytes_done/s.bytes_total)+'%':'8%';
+   (s.errors?` · <a href="#" onclick="showErrors();return false">unreadable ${s.errors}</a>`:'')+
+   (s.stage==='Quick-checking large files'&&s.qtotal?` · ${s.qdone}/${s.qtotal} large files`:'')+
+   (s.current?`<br><span class="hint" title="${esc(s.current)}">now: ${esc(s.current.length>110?'…'+s.current.slice(-110):s.current)}</span>`:'')+
+   ` · <a href="#" onclick="showLog();return false">log</a>`;
+  $('pbar').style.width=s.bytes_total?(100*s.bytes_done/s.bytes_total)+'%':(s.qtotal&&s.stage==='Quick-checking large files'?(100*s.qdone/s.qtotal)+'%':'8%');
   setTimeout(poll,500);return}
  $('progress').style.display='none';
  if(s.phase==='done'){
