@@ -15,7 +15,27 @@ import time
 import urllib.request
 import webbrowser
 
-import webview
+_real_open = webbrowser.open
+
+
+def _unblock_self():
+    """Windows marks files from a downloaded zip as 'from the internet' (a hidden
+    Zone.Identifier stream). .NET then refuses to load pythonnet's Python.Runtime.dll
+    and the window never opens. Strip the mark from our own files before loading it."""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    base = os.path.dirname(os.path.abspath(sys.executable))
+    for d, _, files in os.walk(base):
+        for f in files:
+            try:
+                os.remove(os.path.join(d, f) + ":Zone.Identifier")
+            except OSError:
+                pass
+
+
+_unblock_self()
+
+import webview  # noqa: E402  (after the unblock on purpose)
 
 if os.environ.get("__PYINSTALLER_ANALYSIS_ONLY__"):
     import dedupe_studio  # noqa: F401  (never runs; lets PyInstaller bundle its imports)
@@ -106,7 +126,15 @@ def main():
         url = _url["value"]
         _wait_until_up(url)
         webview.create_window("Dedupe Studio", url, width=1280, height=820, min_size=(900, 600))
-    webview.start()
+    try:
+        webview.start()
+    except Exception:  # noqa: BLE001
+        # The desktop window couldn't start on this PC (.NET / WebView2 problem).
+        # Fall back to the default browser so the app still works.
+        url = _url.get("value")
+        if url:
+            _real_open(url)
+            threading.Event().wait()  # keep the studio running until the console is closed
     os._exit(0)  # stop the studio server when the window closes
 
 
