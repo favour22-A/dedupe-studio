@@ -69,3 +69,15 @@ Output: `dist\DedupeStudio\DedupeStudio.exe` and `dist\DedupeStudio-win64.zip`.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Linux (Debian / Ubuntu)
+
+Download `dedupe-studio_<version>_all.deb` from [Releases](../../releases), then:
+
+```bash
+sudo apt install ./dedupe-studio_1.3.8_all.deb
+dedupe-studio        # app window (also in your app menu)
+dedupe-studio-cli    # terminal version: preview, apply, undo
+```
+
+Build it yourself: `bash packaging/linux/build_deb.sh`.
