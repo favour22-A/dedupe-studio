@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3.3'
+VERSION = '1.3.4'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -58,7 +58,8 @@ SKIP_PRESETS = {
                'Cookies', 'NetHood', 'PrintHood', 'Recent', 'SendTo', 'Start Menu', 'Templates', 'NTUSER*',
                'IntelGraphicsProfiles', 'Windows', 'Program Files', 'Program Files (x86)', 'ProgramData']),
     'hidden': ('Hidden dot folders & files', ['.*']),
-    'cloud': ('Cloud-synced folders', ['OneDrive', 'WPS Cloud Files', 'DriveFS', 'drive_cache', 'Dropbox', 'iCloudDrive']),
+    'cloud': ('Sync caches (plumbing)', ['DriveFS', 'drive_cache', '.dropbox.cache', 'iCloudDrive', 'CloudStore', 'Syncthing', '.stfolder', '.stversions']),
+    'onedrive': ('OneDrive & WPS Cloud', ['OneDrive', 'WPS Cloud Files']),
     'code': ('Code & build folders', ['.git', 'node_modules', '.venv', 'venv', '__pycache__', 'build', 'dist', 'target']),
 }
 PRESETS = {
@@ -956,12 +957,13 @@ a{color:var(--acc)}
   <label>Hash <select id="algo"><option value="sha256">SHA-256</option><option value="md5">MD5 (matches rclone / Drive / DLM CSV)</option></select></label>
   <label>Threads <select id="threads" title="1 is fastest on a single spinning/external disk"><option>1</option><option>2</option><option selected>4</option><option>8</option></select></label>
   <label><input type="checkbox" id="skipjunk" checked> Ignore desktop.ini / Thumbs.db</label>
-  <details class="skipdd" id="skipdd"><summary id="skipsum">Skip: Games</summary><div class="skipbox">
+  <details class="skipdd" id="skipdd"><summary id="skipsum">Skip: Games, Windows, Hidden, Sync, Code</summary><div class="skipbox">
     <label title="Steam, Epic, GOG, Xbox, Minecraft, Roblox, Project Zomboid…: their files repeat on purpose"><input type="checkbox" class="skp" value="games" checked onchange="skipSum()"> Games</label>
-    <label title="AppData, Start Menu, NTUSER, Program Files…"><input type="checkbox" class="skp" value="system" onchange="skipSum()"> Windows system &amp; app data</label>
-    <label title=".claude, .ssh, .bash_history…"><input type="checkbox" class="skp" value="hidden" onchange="skipSum()"> Hidden dot folders &amp; files</label>
-    <label title="OneDrive, WPS Cloud, Google Drive cache, Dropbox, iCloud"><input type="checkbox" class="skp" value="cloud" onchange="skipSum()"> Cloud-synced folders</label>
-    <label title=".git, node_modules, .venv, build, dist…"><input type="checkbox" class="skp" value="code" onchange="skipSum()"> Code &amp; build folders</label>
+    <label title="AppData, Start Menu, NTUSER, Program Files…"><input type="checkbox" class="skp" value="system" checked onchange="skipSum()"> Windows system &amp; app data</label>
+    <label title=".claude, .ssh, .bash_history…"><input type="checkbox" class="skp" value="hidden" checked onchange="skipSum()"> Hidden dot folders &amp; files</label>
+    <label title="Google Drive cache, Dropbox cache, iCloud, Syncthing: apps manage these files, never touch them"><input type="checkbox" class="skp" value="cloud" checked onchange="skipSum()"> Sync caches (plumbing)</label>
+    <label title="OneDrive and WPS Cloud files are your own documents: safe to dedupe"><input type="checkbox" class="skp" value="onedrive" onchange="skipSum()"> OneDrive &amp; WPS Cloud</label>
+    <label title=".git, node_modules, .venv, build, dist…"><input type="checkbox" class="skp" value="code" checked onchange="skipSum()"> Code &amp; build folders</label>
   </div></details>
   <label>Hash list <input id="hlist" style="width:260px" placeholder="optional: path to dlm_windows_md5.csv" title="Reuse hashes from a CSV (MD5,Length,…,FullName) instead of hashing"></label>
  </div>
@@ -998,6 +1000,13 @@ a{color:var(--acc)}
   <button onclick="cancelScan()" style="float:right;padding:2px 10px">Cancel</button>
   <div class="bar"><div id="pbar"></div></div></div>
 
+<div id="guide" style="display:none;margin:10px 16px;padding:12px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel2);font-size:13px;line-height:1.5">
+  <b>First run? Three safety steps.</b><br>
+  1. Test on a <b>small folder</b> first (a Downloads subfolder, a copy of some photos).<br>
+  2. After <b>Auto-select</b>, <b>scroll through the results</b> and check what is ticked before you press Trash.<br>
+  3. Trash <b>moves</b> files to a <code>_dedupe_trash</code> folder inside the scanned folder; nothing is deleted. Keep it about <b>2 weeks</b>; if nothing is missing, delete that folder yourself. <b>Undo…</b> puts files back.<br>
+  Game, Windows, hidden, sync-cache and code folders are skipped by default (Options → Skip).
+  <div style="margin-top:8px"><button onclick="hideGuide()">Got it</button></div></div>
 <main><div id="empty">Pick one or more folders and press <b>Scan</b>.</div>
 <div id="groups"></div><button id="more" style="display:none" onclick="page++;render()">Show more sets</button></main>
 
@@ -1048,6 +1057,8 @@ function toast(msg,ms){const t=$('toast');t.innerHTML=msg;t.style.display='block
 $('type').onchange=()=>{$('exts').style.display=$('type').value==='custom'?'':'none'};
 $('path').addEventListener('keydown',e=>{if(e.key==='Enter')startScan()});
 function skipSum(){const n=[...document.querySelectorAll('.skp:checked')].map(x=>x.parentElement.textContent.trim().split(' ')[0]);$('skipsum').textContent='Skip: '+(n.length?n.join(', '):'nothing')}
+function hideGuide(){$('guide').style.display='none';try{localStorage.setItem('ds_guide_seen','1')}catch(e){}}
+function showGuideIfNew(){let seen=null;try{seen=localStorage.getItem('ds_guide_seen')}catch(e){}if(!seen)$('guide').style.display='block'}
 function toggleOpts(){const o=$('opts');o.style.display=o.style.display==='flex'?'none':'flex'}
 
 /* ---------- scanning ---------- */
@@ -1213,6 +1224,7 @@ async function bload(p){const r=await api('/api/browse',{path:p});if(!r.ok){toas
 function chooseBrowse(){if(bcur)addRoot(bcur);closeM('browseM')}
 function closeM(id){$(id).style.display='none'}
 poll();
+showGuideIfNew();
 </script></body></html>
 """
 
