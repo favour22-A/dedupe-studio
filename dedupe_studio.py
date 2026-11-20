@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3.5'
+VERSION = '1.3.6'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -398,7 +398,20 @@ def scan_worker(roots, opts):
 
 
 # ------------------------------------------------------------------ moves
+def lp(p):
+    """Windows long paths: the trash adds about 30 characters, which pushed deep files
+    (browser profiles, app backups) past 260 and failed with WinError 3. The \\?\
+    prefix lifts that limit without any registry change. No-op elsewhere."""
+    if os.name != 'nt' or p.startswith('\\\\?\\') or len(p) < 240:
+        return p
+    p = os.path.abspath(p)
+    if p.startswith('\\\\'):          # network share \\server\share
+        return '\\\\?\\UNC\\' + p[2:]
+    return '\\\\?\\' + p
+
+
 def move_file(src, dest):
+    src, dest = lp(src), lp(dest)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     try:
         os.rename(src, dest)
@@ -501,7 +514,7 @@ def do_trash(paths, mode, action='trash', check_only=False):
                     dest = dest + '.' + str(time.time_ns())
             try:
                 if delete:
-                    os.remove(p)
+                    os.remove(lp(p))
                 else:
                     move_file(p, dest)
             except Exception as e:  # noqa: BLE001
