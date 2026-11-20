@@ -39,13 +39,18 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3'
+VERSION = '1.3.2'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
 JUNK_NAMES = {'desktop.ini', 'thumbs.db', '.ds_store'}
 DEFAULT_EXCLUDES = ['.git', 'node_modules', '$RECYCLE.BIN', 'System Volume Information',
                     '*/AppData/Local/Temp/*', '__pycache__']
+# Game installs, saves and mods repeat files on purpose: never dedupe them (v1.3.2)
+GAME_EXCLUDES = ['steamapps', 'SteamLibrary', 'Steam', 'Epic Games', 'GOG Games', 'GOG Galaxy',
+                 'Origin Games', 'EA Games', 'Ubisoft Game Launcher', 'Battle.net', 'Riot Games',
+                 'XboxGames', 'WindowsApps', 'My Games', 'Saved Games', '.minecraft', 'Roblox',
+                 'Zomboid', 'ProjectZomboid', 'Project Zomboid']
 PRESETS = {
     'all': None,
     'pictures': {'.jpg', '.jpeg', '.png', '.gif', '.bmp', '.heic', '.heif', '.webp', '.raw',
@@ -802,6 +807,8 @@ class Handler(BaseHTTPRequestHandler):
             if preset == 'custom' and custom:
                 exts = {('.' + e.strip().lstrip('.').lower()) for e in custom.split(',') if e.strip()}
             excludes = [x.strip() for x in (req.get('excludes') or '').replace('\n', ';').split(';') if x.strip()]
+            if req.get('skip_games', True):
+                excludes += GAME_EXCLUDES
             with LOCK:
                 if STATE['phase'] == 'scanning':
                     return self._json({'ok': False, 'error': 'Scan already running'})
@@ -933,6 +940,7 @@ a{color:var(--acc)}
   <label>Hash <select id="algo"><option value="sha256">SHA-256</option><option value="md5">MD5 (matches rclone / Drive / DLM CSV)</option></select></label>
   <label>Threads <select id="threads" title="1 is fastest on a single spinning/external disk"><option>1</option><option>2</option><option selected>4</option><option>8</option></select></label>
   <label><input type="checkbox" id="skipjunk" checked> Ignore desktop.ini / Thumbs.db</label>
+  <label title="Steam, Epic, GOG, Xbox, Minecraft, Roblox, Project Zomboid and other game folders: their files repeat on purpose"><input type="checkbox" id="skipgames" checked> Skip game folders</label>
   <label>Hash list <input id="hlist" style="width:260px" placeholder="optional: path to dlm_windows_md5.csv" title="Reuse hashes from a CSV (MD5,Length,…,FullName) instead of hashing"></label>
  </div>
 </header>
@@ -1025,7 +1033,7 @@ async function startScan(){
  const minsz=Math.round((parseFloat($('minsz').value)||0)*parseInt($('minu').value));
  let r;try{r=await api('/api/scan',{roots,type:$('type').value,exts:$('exts').value,min_size:minsz,
   match:$('nmatch').value,excludes:$('excl').value,algo:$('algo').value,threads:parseInt($('threads').value),
-  skip_junk:$('skipjunk').checked,hash_list:$('hlist').value,
+  skip_junk:$('skipjunk').checked,skip_games:$('skipgames').checked,hash_list:$('hlist').value,
   include_singletons:mode==='destructive'&&!!$('nmatch').value.trim()})}catch(e){toast(esc(e.message));return}
  if(!r.ok){toast(esc(r.error));return}
  if(r.algo!==$('algo').value){$('algo').value=r.algo;toast('Hash set to '+r.algo.toUpperCase()+' to match the hash list')}
