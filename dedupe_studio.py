@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3.6'
+VERSION = '1.3.7'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -947,6 +947,7 @@ a{color:var(--acc)}
 .skipdd{position:relative}.skipdd summary{cursor:pointer;list-style:none;padding:4px 10px;border:1px solid var(--line);border-radius:6px;font-size:12px;color:var(--dim)}
 .skipdd .skipbox{position:absolute;z-index:20;top:110%;left:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-width:240px}
 body.dropping{outline:3px dashed var(--acc);outline-offset:-8px}
+#errlist div{user-select:text;-webkit-user-select:text}
 </style></head><body>
 <header>
  <div class="hrow">
@@ -1051,7 +1052,7 @@ body.dropping{outline:3px dashed var(--acc);outline-offset:-8px}
 <div class="modal" id="errM"><div class="box">
   <b>Unreadable files</b><div id="errcount" class="hint"></div>
   <div class="list" id="errlist"></div>
-  <div style="display:flex;gap:8px;justify-content:flex-end"><button onclick="closeM('errM')">Close</button></div>
+  <div style="display:flex;gap:8px;justify-content:flex-end"><button onclick="copyErr()">Copy all</button><button onclick="saveErr()">Save as .txt</button><button onclick="closeM('errM')">Close</button></div>
 </div></div>
 
 <script>
@@ -1073,6 +1074,13 @@ $('path').addEventListener('keydown',e=>{if(e.key==='Enter')startScan()});
 function skipSum(){const n=[...document.querySelectorAll('.skp:checked')].map(x=>x.parentElement.textContent.trim().split(' ')[0]);$('skipsum').textContent='Skip: '+(n.length?n.join(', '):'nothing')}
 function hideGuide(){$('guide').style.display='none';try{localStorage.setItem('ds_guide_seen','1')}catch(e){}}
 function showGuideIfNew(){let seen=null;try{seen=localStorage.getItem('ds_guide_seen')}catch(e){}if(!seen)$('guide').style.display='block'}
+function errText(){return ($('errcount').innerText+'\n\n'+[...$('errlist').children].map(d=>d.innerText.replace(/\n\u21b3 /,'  ->  ')).join('\n')).trim()}
+async function copyErr(){const t=errText();let ok=false;
+ try{await navigator.clipboard.writeText(t);ok=true}catch(e){}
+ if(!ok){const a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();try{ok=document.execCommand('copy')}catch(e){}a.remove()}
+ toast(ok?`Copied ${t.split('\n').length} lines`:'Copy failed: use Save as .txt',3000)}
+function saveErr(){const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([errText()],{type:'text/plain'}));
+ a.download='dedupe_problems_'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.txt';document.body.appendChild(a);a.click();a.remove()}
 function toggleOpts(){const o=$('opts');o.style.display=o.style.display==='flex'?'none':'flex'}
 
 /* ---------- scanning ---------- */
