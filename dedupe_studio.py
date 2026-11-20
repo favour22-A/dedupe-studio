@@ -39,7 +39,7 @@ from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-VERSION = '1.3.4'
+VERSION = '1.3.5'
 SANE_EPOCH = 315532800.0  # 1980-01-01
 QH_MIN = 8 * 1024 * 1024  # quick-hash prefilter for files >= 8 MB
 GSHORTCUTS = ('.gdoc', '.gsheet', '.gslides', '.gdraw', '.gform', '.gmap', '.gsite', '.glink')
@@ -933,11 +933,12 @@ width:min(760px,92vw);max-height:80vh;display:flex;flex-direction:column;padding
 a{color:var(--acc)}
 .skipdd{position:relative}.skipdd summary{cursor:pointer;list-style:none;padding:4px 10px;border:1px solid var(--line);border-radius:6px;font-size:12px;color:var(--dim)}
 .skipdd .skipbox{position:absolute;z-index:20;top:110%;left:0;background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-width:240px}
+body.dropping{outline:3px dashed var(--acc);outline-offset:-8px}
 </style></head><body>
 <header>
  <div class="hrow">
   <h1>Dedupe Studio<small>v%%VERSION%%</small></h1>
-  <input id="path" placeholder="Folder(s) to scan — several: separate with ;  e.g. C:\Users\Admin\Inbox; J:\EverythingFolder">
+  <input id="path" placeholder="Drop folders here, or type them (several: separate with ;) e.g. C:\Users\Admin\Inbox; J:\EverythingFolder">
   <button onclick="openBrowse()" title="Add a folder">Add folder…</button>
   <select id="type">
     <option value="all">All files</option><option value="pictures">Pictures</option>
@@ -1225,6 +1226,14 @@ function chooseBrowse(){if(bcur)addRoot(bcur);closeM('browseM')}
 function closeM(id){$(id).style.display='none'}
 poll();
 showGuideIfNew();
+/* drag-and-drop: the desktop app adds the real paths; a plain browser can't see paths */
+let dragN=0;
+document.addEventListener('dragenter',e=>{e.preventDefault();dragN++;document.body.classList.add('dropping')});
+document.addEventListener('dragleave',e=>{if(--dragN<=0){dragN=0;document.body.classList.remove('dropping')}});
+document.addEventListener('dragover',e=>e.preventDefault());
+document.addEventListener('drop',e=>{e.preventDefault();dragN=0;document.body.classList.remove('dropping');
+ if(window.pywebview)toast('Folder added — press Scan',2500);
+ else toast('Drag-and-drop works in the desktop app. Here, type or paste the folder path.',5000)});
 </script></body></html>
 """
 

@@ -20,7 +20,7 @@ Windows app (portable, no install). Also runs on Linux, macOS and Android (Termu
 
 ## How to use
 
-1. Type or add the folder(s) to scan. Several folders: separate with `;`.
+1. Drag folders onto the window, or type or add them. Several folders: separate with `;`.
 2. **First time: test on a small folder.**
 3. Press **Scan**.
 4. Press **Auto-select shown**. The default keeps the oldest copy (one per folder, up to two across folders).

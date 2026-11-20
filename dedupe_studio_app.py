@@ -6,6 +6,7 @@ studio's webbrowser.open() call, or a localhost URL it prints. Set
 DEDUPE_STUDIO_URL to force an address.
 """
 import io
+import json
 import os
 import re
 import runpy
@@ -109,6 +110,32 @@ def _wait_until_up(url, timeout=30):
     return False
 
 
+def _bind_drop(win):
+    """Drag-and-drop: a browser page never sees full paths, but pywebview's drop event
+    does (pywebviewFullPath). A dropped file adds its folder."""
+    try:
+        from webview.dom import DOMEventHandler
+    except Exception:  # noqa: BLE001
+        return
+
+    def on_drop(e):
+        for f in ((e or {}).get("dataTransfer") or {}).get("files") or []:
+            p = f.get("pywebviewFullPath")
+            if not p:
+                continue
+            if not os.path.isdir(p):
+                p = os.path.dirname(p)
+            win.evaluate_js("addRoot(%s)" % json.dumps(p))
+
+    def on_loaded():
+        try:
+            win.dom.document.events.drop += DOMEventHandler(on_drop, True, True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    win.events.loaded += on_loaded
+
+
 def main():
     forced = os.environ.get("DEDUPE_STUDIO_URL")
     if forced:
@@ -125,7 +152,8 @@ def main():
     else:
         url = _url["value"]
         _wait_until_up(url)
-        webview.create_window("Dedupe Studio", url, width=1280, height=820, min_size=(900, 600))
+        win = webview.create_window("Dedupe Studio", url, width=1280, height=820, min_size=(900, 600))
+        _bind_drop(win)
     try:
         webview.start()
     except Exception:  # noqa: BLE001
